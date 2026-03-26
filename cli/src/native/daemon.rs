@@ -152,9 +152,13 @@ async fn run_socket_server(
             }
             _ = drain_interval.tick() => {
                 let mut s = state.lock().await;
-                if s.request_tracking || s.har_recording {
-                    s.drain_cdp_events_background();
-                }
+                // Always drain and process target lifecycle events
+                // (targetCreated, targetDestroyed, targetInfoChanged)
+                // even when no commands are being executed. Without this,
+                // the broadcast channel (256 slots) overflows between CLI
+                // invocations, silently dropping target events and causing
+                // `tab list` to miss tabs opened after connect.
+                s.drain_and_process_targets().await;
             }
             _ = async {
                 if let Some(ref mut s) = sleep_pin {

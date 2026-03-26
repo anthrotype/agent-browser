@@ -180,6 +180,9 @@ pub struct DaemonState {
     pub tracing_state: TracingState,
     pub recording_state: RecordingState,
     event_rx: Option<broadcast::Receiver<CdpEvent>>,
+    /// Dedicated receiver for Target.* lifecycle events, separate from the
+    /// main event channel to avoid losing target tracking due to buffer overflow.
+    target_event_rx: Option<broadcast::Receiver<CdpEvent>>,
     pub screencasting: bool,
     pub policy: Option<ActionPolicy>,
     pub pending_confirmation: Option<PendingConfirmation>,
@@ -237,6 +240,7 @@ impl DaemonState {
             tracing_state: TracingState::new(),
             recording_state: RecordingState::new(),
             event_rx: None,
+            target_event_rx: None,
             screencasting: false,
             policy: ActionPolicy::load_if_exists(),
             pending_confirmation: None,
@@ -282,6 +286,7 @@ impl DaemonState {
     fn subscribe_to_browser_events(&mut self) {
         if let Some(ref browser) = self.browser {
             self.event_rx = Some(browser.client.subscribe());
+            self.target_event_rx = Some(browser.client.subscribe_target_events());
         }
     }
 
@@ -458,12 +463,65 @@ impl DaemonState {
         let _ = self.drain_cdp_events();
     }
 
-    fn drain_cdp_events(&mut self) -> DrainedEvents {
-        let rx = match self.event_rx.as_mut() {
-            Some(rx) => rx,
-            None => return DrainedEvents::default(),
-        };
+    /// Drain CDP events and process target lifecycle (create/destroy/change).
+    /// This must be called periodically so that `Target.targetCreated` events
+    /// are not lost when the broadcast channel overflows between commands.
+    pub async fn drain_and_process_targets(&mut self) {
+        let drained = self.drain_cdp_events();
 
+        for target_id in &drained.destroyed_targets {
+            if let Some(ref mut mgr) = self.browser {
+                mgr.remove_page_by_target_id(target_id);
+            }
+        }
+
+        for te in &drained.new_targets {
+            if let Some(ref mut mgr) = self.browser {
+                let attach_result: Result<AttachToTargetResult, String> = mgr
+                    .client
+                    .send_command_typed(
+                        "Target.attachToTarget",
+                        &AttachToTargetParams {
+                            target_id: te.target_info.target_id.clone(),
+                            flatten: true,
+                        },
+                        None,
+                    )
+                    .await;
+                if let Ok(attach) = attach_result {
+                    let _ = mgr.enable_domains_pub(&attach.session_id).await;
+
+                    let df = self.domain_filter.read().await;
+                    if let Some(ref filter) = *df {
+                        let has_proxy_creds = self.proxy_credentials.read().await.is_some();
+                        let _ = network::install_domain_filter(
+                            &mgr.client,
+                            &attach.session_id,
+                            &filter.allowed_domains,
+                            has_proxy_creds,
+                        )
+                        .await;
+                    }
+
+                    mgr.add_page(super::browser::PageInfo {
+                        target_id: te.target_info.target_id.clone(),
+                        session_id: attach.session_id,
+                        url: te.target_info.url.clone(),
+                        title: te.target_info.title.clone(),
+                        target_type: te.target_info.target_type.clone(),
+                    });
+                }
+            }
+        }
+
+        for te in &drained.changed_targets {
+            if let Some(ref mut mgr) = self.browser {
+                mgr.update_page_target_info(&te.target_info);
+            }
+        }
+    }
+
+    fn drain_cdp_events(&mut self) -> DrainedEvents {
         let mut pending_acks: Vec<i64> = Vec::new();
         let mut new_targets: Vec<TargetCreatedEvent> = Vec::new();
         let mut changed_targets: Vec<TargetInfoChangedEvent> = Vec::new();
@@ -471,11 +529,13 @@ impl DaemonState {
         let mut attached_iframe_sessions: Vec<(String, String)> = Vec::new();
         let mut detached_iframe_sessions: Vec<String> = Vec::new();
 
-        loop {
-            match rx.try_recv() {
-                Ok(event) => {
-                    // Target events are not session-scoped; handle them first
-                    match event.method.as_str() {
+        // Drain target lifecycle events from the dedicated channel first.
+        // This channel has its own buffer and is immune to overflow from
+        // high-volume session events (console, network, DOM, etc.).
+        if let Some(ref mut target_rx) = self.target_event_rx {
+            loop {
+                match target_rx.try_recv() {
+                    Ok(event) => match event.method.as_str() {
                         "Target.targetCreated" => {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
@@ -490,7 +550,6 @@ impl DaemonState {
                                     }
                                 }
                             }
-                            continue;
                         }
                         "Target.targetInfoChanged" => {
                             if let Ok(te) = serde_json::from_value::<TargetInfoChangedEvent>(
@@ -500,7 +559,6 @@ impl DaemonState {
                                     changed_targets.push(te);
                                 }
                             }
-                            continue;
                         }
                         "Target.targetDestroyed" => {
                             if let Ok(te) =
@@ -508,8 +566,43 @@ impl DaemonState {
                             {
                                 destroyed_targets.push(te.target_id);
                             }
-                            continue;
                         }
+                        _ => {}
+                    },
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        self.target_event_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Drain session-scoped events from the main channel.
+        let rx = match self.event_rx.as_mut() {
+            Some(rx) => rx,
+            None => {
+                return DrainedEvents {
+                    pending_acks,
+                    new_targets,
+                    changed_targets,
+                    destroyed_targets,
+                    attached_iframe_sessions,
+                    detached_iframe_sessions,
+                };
+            }
+        };
+
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    // Skip target lifecycle events here — already drained
+                    // from the dedicated channel above.
+                    match event.method.as_str() {
+                        "Target.targetCreated"
+                        | "Target.targetInfoChanged"
+                        | "Target.targetDestroyed" => continue,
                         "Target.attachedToTarget" => {
                             if let (Some(sid), Some(target_info)) = (
                                 event.params.get("sessionId").and_then(|v| v.as_str()),

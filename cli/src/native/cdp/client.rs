@@ -38,6 +38,11 @@ pub struct CdpClient {
     next_id: AtomicU64,
     pending: PendingMap,
     event_tx: broadcast::Sender<CdpEvent>,
+    /// Dedicated channel for Target.* lifecycle events (targetCreated,
+    /// targetInfoChanged, targetDestroyed). Separated from the main event
+    /// channel so that high-volume session events (console, network, DOM)
+    /// cannot evict critical target tracking events from the buffer.
+    target_event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _keepalive_handle: tokio::task::JoinHandle<()>,
@@ -71,10 +76,12 @@ impl CdpClient {
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel(256);
+        let (target_event_tx, _) = broadcast::channel(64);
         let (raw_tx, _) = broadcast::channel(512);
 
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
+        let target_event_tx_clone = target_event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
 
         // Notify used to stop the keepalive task when the reader loop exits.
@@ -128,6 +135,11 @@ impl CdpClient {
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
                     };
+                    // Route Target.* lifecycle events to a dedicated channel
+                    // so they are never evicted by high-volume session events.
+                    if method.starts_with("Target.") {
+                        let _ = target_event_tx_clone.send(event.clone());
+                    }
                     let _ = event_tx_clone.send(event);
                 }
             }
@@ -165,6 +177,7 @@ impl CdpClient {
             next_id: AtomicU64::new(1),
             pending,
             event_tx,
+            target_event_tx,
             raw_tx,
             _reader_handle: reader_handle,
             _keepalive_handle: keepalive_handle,
@@ -222,6 +235,14 @@ impl CdpClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Subscribe to Target.* lifecycle events only (targetCreated,
+    /// targetInfoChanged, targetDestroyed). This channel is separate from the
+    /// main event channel and has its own buffer, so high-volume session events
+    /// cannot evict target tracking events.
+    pub fn subscribe_target_events(&self) -> broadcast::Receiver<CdpEvent> {
+        self.target_event_tx.subscribe()
     }
 
     /// Subscribe to all raw incoming CDP messages (responses + events).

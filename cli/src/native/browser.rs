@@ -90,6 +90,14 @@ fn validate_lightpanda_options(options: &LaunchOptions) -> Result<(), String> {
 /// Returns true for Chrome internal targets that should not be selected
 /// during auto-connect (e.g. chrome://, chrome-extension://, devtools://).
 fn is_internal_chrome_target(url: &str) -> bool {
+    // chrome://newtab/ and chrome://new-tab-page/ are user-visible tabs
+    // that will shortly navigate to a real URL; they must be tracked.
+    if url == "chrome://newtab/"
+        || url.starts_with("chrome://newtab/?")
+        || url.starts_with("chrome://new-tab-page")
+    {
+        return false;
+    }
     url.starts_with("chrome://")
         || url.starts_with("chrome-extension://")
         || url.starts_with("devtools://")
